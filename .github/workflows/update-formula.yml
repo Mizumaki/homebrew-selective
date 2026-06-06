@@ -1,0 +1,115 @@
+name: Update Formula
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version of Mizumaki/selective without the leading v (e.g. 0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Normalize version
+        id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          v="$INPUT_VERSION"
+          if [[ ! "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid version: '$v' (must be a bare semver like 0.1.0, no leading 'v')" >&2
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch sha256 sums from release
+        id: sums
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO="Mizumaki/selective"
+          TAG="v${VERSION}"
+
+          gh release view "$TAG" --repo "$REPO" >/dev/null
+
+          tmp="$(mktemp -d)"
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu; do
+            asset="selective-${VERSION}-${target}.tar.gz.sha256"
+            gh release download "$TAG" --repo "$REPO" --pattern "$asset" --dir "$tmp"
+            sum="$(awk '{print $1}' "$tmp/$asset")"
+            if [[ ! "$sum" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "Invalid sha256 for ${target}: ${sum}" >&2
+              exit 1
+            fi
+            echo "${target}=${sum}" >> "$GITHUB_OUTPUT"
+            echo "${target}: ${sum}"
+          done
+
+      - name: Regenerate Formula
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          SHA_ARM_DARWIN: ${{ steps.sums.outputs.aarch64-apple-darwin }}
+          SHA_X86_DARWIN: ${{ steps.sums.outputs.x86_64-apple-darwin }}
+          SHA_X86_LINUX: ${{ steps.sums.outputs.x86_64-unknown-linux-gnu }}
+        run: |
+          set -euo pipefail
+          cat > Formula/selective.rb <<EOF
+          class Selective < Formula
+            desc "Interactive single-select filter for the shell"
+            homepage "https://github.com/Mizumaki/selective"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/Mizumaki/selective/releases/download/v${VERSION}/selective-${VERSION}-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_ARM_DARWIN}"
+              end
+
+              on_intel do
+                url "https://github.com/Mizumaki/selective/releases/download/v${VERSION}/selective-${VERSION}-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_X86_DARWIN}"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "https://github.com/Mizumaki/selective/releases/download/v${VERSION}/selective-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_X86_LINUX}"
+              end
+            end
+
+            def install
+              bin.install "selective"
+            end
+
+            test do
+              assert_match "selective", shell_output("#{bin}/selective --help")
+            end
+          end
+          EOF
+          ruby -c Formula/selective.rb
+
+      - name: Commit and push
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet Formula/selective.rb; then
+            echo "Formula already up to date for v${VERSION}"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/selective.rb
+          git commit -m "chore: update selective to v${VERSION}"
+          git push
